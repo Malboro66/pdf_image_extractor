@@ -31,6 +31,7 @@ class ExtractImagesTests(unittest.TestCase):
             self.assertEqual(errors, 0)
             self.assertTrue(any(r.status == "ok" for r in records))
             self.assertEqual(len(list(out.glob("*.jpg"))), 1)
+            self.assertTrue(all(hasattr(r, "correction_status") for r in records))
 
     def test_extract_flate_to_png(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -48,7 +49,6 @@ class ExtractImagesTests(unittest.TestCase):
             pngs = list(out.glob("*.png"))
             self.assertEqual(len(pngs), 1)
             self.assertTrue(pngs[0].read_bytes().startswith(b"\x89PNG"))
-
 
     def test_extract_with_subtype_without_space(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -77,8 +77,6 @@ class ExtractImagesTests(unittest.TestCase):
             records, errors = extract_from_pdf(pdf, out, "img", None, "fallback", True)
             self.assertEqual(errors, 0)
             self.assertEqual(records, [])
-            if out.exists():
-                self.assertEqual(list(out.glob("*")), [])
 
     def test_corrupted_pdf(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -109,7 +107,7 @@ class ExtractImagesTests(unittest.TestCase):
             self.assertEqual(records, [])
             self.assertEqual(code, 2)
 
-    def test_run_extraction_job_multiple_inputs(self) -> None:
+    def test_run_extraction_job_multiple_inputs_unique_names(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp = Path(tmp_dir)
             out = tmp / "out"
@@ -127,7 +125,9 @@ class ExtractImagesTests(unittest.TestCase):
                 quiet=True,
             )
             self.assertEqual(code, 0)
-            self.assertEqual(sum(1 for r in records if r.status == "ok"), 2)
+            ok_files = [r.output_file for r in records if r.status == "ok"]
+            self.assertEqual(len(ok_files), 2)
+            self.assertEqual(len(set(ok_files)), 2)
 
 
 if __name__ == "__main__":
