@@ -20,6 +20,7 @@ NUMBER_RE = re.compile(rb"/(Width|Height|BitsPerComponent)\s+(\d+)")
 COLORSPACE_RE = re.compile(rb"/ColorSpace\s*/([A-Za-z0-9]+)")
 DECODE_RE = re.compile(rb"/Decode\s*\[(.*?)\]", re.DOTALL)
 FLOAT_RE = re.compile(rb"-?\d+(?:\.\d+)?")
+SUBTYPE_IMAGE_RE = re.compile(rb"/Subtype\s*/Image")
 
 
 @dataclass
@@ -292,7 +293,7 @@ def _extract_with_fallback(pdf_path: Path) -> list[dict[str, Any]]:
 
     for match in OBJ_RE.finditer(pdf_bytes):
         body = match.group(3)
-        if b"/Subtype /Image" not in body or b"stream" not in body:
+        if not SUBTYPE_IMAGE_RE.search(body) or b"stream" not in body:
             continue
 
         stream_pos = body.find(b"stream")

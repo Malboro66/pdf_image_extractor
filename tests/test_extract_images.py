@@ -49,6 +49,22 @@ class ExtractImagesTests(unittest.TestCase):
             self.assertEqual(len(pngs), 1)
             self.assertTrue(pngs[0].read_bytes().startswith(b"\x89PNG"))
 
+
+    def test_extract_with_subtype_without_space(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            pdf = tmp / "nospace.pdf"
+            out = tmp / "out"
+            raw = bytes([10, 20, 30])
+            comp = zlib.compress(raw)
+            image_dict = b"<< /Type /XObject /Subtype/Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode /Length 20 >>"
+            _write_pdf_with_image(pdf, comp, image_dict)
+
+            records, errors = extract_from_pdf(pdf, out, "img", None, "fallback", True)
+            self.assertEqual(errors, 0)
+            self.assertTrue(any(r.status == "ok" for r in records))
+            self.assertEqual(len(list(out.glob("*.png"))), 1)
+
     def test_skip_text_like_image_mask(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp = Path(tmp_dir)
