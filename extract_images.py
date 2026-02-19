@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import io
 import json
 import re
 import sys
@@ -175,6 +176,38 @@ def _apply_decode_transform(decoded: bytes, meta: dict[str, Any]) -> bytes:
     return bytes(data)
 
 
+def _has_decode_inversion(meta: dict[str, Any]) -> bool:
+    decode = meta.get("Decode")
+    if not isinstance(decode, list):
+        return False
+    for i in range(0, len(decode), 2):
+        low = decode[i]
+        high = decode[i + 1] if i + 1 < len(decode) else low
+        if high < low:
+            return True
+    return False
+
+
+def _invert_direct_image_bytes(data: bytes) -> bytes | None:
+    try:
+        from PIL import Image, ImageOps  # type: ignore
+    except Exception:
+        return None
+
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            if img.mode == "1":
+                img = img.convert("L")
+            elif img.mode in {"P", "CMYK", "RGBA", "LA"}:
+                img = img.convert("RGB")
+            inv = ImageOps.invert(img)
+            out = io.BytesIO()
+            inv.save(out, format="PNG")
+            return out.getvalue()
+    except Exception:
+        return None
+
+
 def _raw_to_png(data: bytes, width: int, height: int, color_space: str | None, bits: int | None) -> bytes | None:
     if not width or not height or bits != 8:
         return None
@@ -231,10 +264,16 @@ def _raw_to_tiff_gray(data: bytes, width: int, height: int, bits: int | None) ->
 
 
 def _choose_output(decoded: bytes, filters: list[str], meta: dict[str, Any]) -> tuple[bytes, str]:
-    if any(f in {"DCTDecode", "DCT"} for f in filters):
-        return decoded, "jpg"
-    if any(f in {"JPXDecode", "JPX"} for f in filters):
-        return decoded, "jp2"
+    direct_dct = any(f in {"DCTDecode", "DCT"} for f in filters)
+    direct_jpx = any(f in {"JPXDecode", "JPX"} for f in filters)
+
+    if direct_dct or direct_jpx:
+        if _has_decode_inversion(meta):
+            corrected = _invert_direct_image_bytes(decoded)
+            if corrected is not None:
+                return corrected, "png"
+        return (decoded, "jpg") if direct_dct else (decoded, "jp2")
+
     if any(f in {"CCITTFaxDecode", "CCF"} for f in filters):
         return decoded, "tiff"
 
@@ -425,6 +464,14 @@ def _collect_pdfs(path: Path, recursive: bool) -> list[Path]:
     return []
 
 
+def _collect_pdfs_from_inputs(paths: list[Path], recursive: bool) -> list[Path]:
+    all_pdfs: list[Path] = []
+    for p in paths:
+        all_pdfs.extend(_collect_pdfs(p, recursive))
+    unique = sorted({pdf.resolve() for pdf in all_pdfs})
+    return unique
+
+
 def _write_report(records: list[ExtractionRecord], report_base: Path, formats: set[str]) -> None:
     if "json" in formats:
         report_base.with_suffix(".json").write_text(json.dumps([asdict(r) for r in records], ensure_ascii=False, indent=2), encoding="utf-8")
@@ -438,7 +485,7 @@ def _write_report(records: list[ExtractionRecord], report_base: Path, formats: s
 
 
 def run_extraction_job(
-    input_path: Path,
+    input_paths: list[Path],
     output_dir: Path,
     prefix: str = "imagem",
     recursive: bool = False,
@@ -450,7 +497,7 @@ def run_extraction_job(
     engine: str = "auto",
     quiet: bool = False,
 ) -> tuple[list[ExtractionRecord], int]:
-    pdfs = _collect_pdfs(input_path, recursive)
+    pdfs = _collect_pdfs_from_inputs(input_paths, recursive)
     if not pdfs:
         return [], 2
 
@@ -480,7 +527,7 @@ def run_extraction_job(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Extrai imagens de PDFs com relatório e opções para produção.")
-    parser.add_argument("input", type=Path, help="Arquivo PDF ou diretório contendo PDFs.")
+    parser.add_argument("inputs", nargs="+", type=Path, help="Um ou mais arquivos PDF e/ou diretórios contendo PDFs.")
     parser.add_argument("-o", "--output-dir", type=Path, default=Path("imagens_extraidas"), help="Diretório de saída.")
     parser.add_argument("--prefix", default="imagem", help="Prefixo dos arquivos gerados.")
     parser.add_argument("--recursive", action="store_true", help="Busca PDFs recursivamente quando input for diretório.")
@@ -505,7 +552,7 @@ def main() -> int:
     report_formats = {x.strip().lower() for x in args.report_format.split(",") if x.strip()}
 
     records, exit_code = run_extraction_job(
-        input_path=args.input,
+        input_paths=args.inputs,
         output_dir=args.output_dir,
         prefix=args.prefix,
         recursive=args.recursive,

@@ -103,11 +103,31 @@ class ExtractImagesTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp = Path(tmp_dir)
             records, code = run_extraction_job(
-                input_path=tmp / "missing.pdf",
+                input_paths=[tmp / "missing.pdf"],
                 output_dir=tmp / "out",
             )
             self.assertEqual(records, [])
             self.assertEqual(code, 2)
+
+    def test_run_extraction_job_multiple_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            out = tmp / "out"
+            pdf1 = tmp / "a.pdf"
+            pdf2 = tmp / "b.pdf"
+            img = b"\xff\xd8\xff\xd9"
+            dct = b"<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length 4 >>"
+            _write_pdf_with_image(pdf1, img, dct)
+            _write_pdf_with_image(pdf2, img, dct)
+
+            records, code = run_extraction_job(
+                input_paths=[pdf1, pdf2],
+                output_dir=out,
+                engine="fallback",
+                quiet=True,
+            )
+            self.assertEqual(code, 0)
+            self.assertEqual(sum(1 for r in records if r.status == "ok"), 2)
 
 
 if __name__ == "__main__":

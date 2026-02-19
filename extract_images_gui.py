@@ -63,13 +63,14 @@ class App(ttk.Frame):
         card.columnconfigure(1, weight=1)
 
         self.input_var = tk.StringVar()
+        self.input_paths: list[Path] = []
         self.output_var = tk.StringVar(value=str(Path("imagens_extraidas").resolve()))
         self.prefix_var = tk.StringVar(value="imagem")
         self.engine_var = tk.StringVar(value="auto")
         self.recursive_var = tk.BooleanVar(value=False)
         self.continue_var = tk.BooleanVar(value=True)
 
-        self._row_path(card, 0, "Entrada (PDF ou pasta)", self.input_var, self._pick_input)
+        self._row_path(card, 0, "Entradas (PDFs ou pasta)", self.input_var, self._pick_input)
         self._row_path(card, 1, "Saída das imagens", self.output_var, self._pick_output)
         self._row_entry(card, 2, "Prefixo", self.prefix_var)
         ttk.Label(card, text="Engine", style="Label.TLabel").grid(row=3, column=0, sticky="w", pady=8)
@@ -101,12 +102,14 @@ class App(ttk.Frame):
         ttk.Entry(parent, textvariable=var).grid(row=row, column=1, columnspan=2, sticky="ew", padx=(8, 0), pady=8)
 
     def _pick_input(self) -> None:
-        selected = filedialog.askopenfilename(title="Selecione um PDF", filetypes=[("PDF", "*.pdf"), ("Todos", "*.*")])
-        if selected:
-            self.input_var.set(selected)
+        selected_files = filedialog.askopenfilenames(title="Selecione um ou mais PDFs", filetypes=[("PDF", "*.pdf"), ("Todos", "*.*")])
+        if selected_files:
+            self.input_paths = [Path(p) for p in selected_files]
+            self.input_var.set("; ".join(str(p) for p in self.input_paths))
             return
         selected_dir = filedialog.askdirectory(title="Ou selecione uma pasta com PDFs")
         if selected_dir:
+            self.input_paths = [Path(selected_dir)]
             self.input_var.set(selected_dir)
 
     def _pick_output(self) -> None:
@@ -129,11 +132,11 @@ class App(ttk.Frame):
 
     def _run_job(self) -> None:
         try:
-            input_path = Path(self.input_var.get().strip())
             output_dir = Path(self.output_var.get().strip())
-            self.master.after(0, lambda: self._append_status(f"Iniciando processamento de: {input_path}"))
+            inputs = self.input_paths if self.input_paths else [Path(self.input_var.get().strip())]
+            self.master.after(0, lambda: self._append_status(f"Iniciando processamento de {len(inputs)} entrada(s)."))
             records, code = run_extraction_job(
-                input_path=input_path,
+                input_paths=inputs,
                 output_dir=output_dir,
                 prefix=self.prefix_var.get().strip() or "imagem",
                 recursive=self.recursive_var.get(),
