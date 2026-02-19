@@ -25,7 +25,7 @@ python extract_images_gui.py
 Recursos da GUI:
 
 - Seleção de PDF único ou diretório de PDFs.
-- Configuração de pasta de saída, prefixo, engine e tamanho mínimo.
+- Configuração de pasta de saída, prefixo e engine.
 - Opções de processamento recursivo e continuidade em erro.
 - Feedback de status em tempo real.
 
@@ -41,7 +41,7 @@ python extract_images.py caminho/arquivo.pdf
 - Reconstrução de imagens raw para `PNG/TIFF` quando possível.
 - Relatório detalhado em JSON/CSV com status por imagem.
 - Operação em lote com diretório + `--recursive`.
-- UX para produção: `--fail-fast`, `--continue-on-error`, `--min-size`, `--only-format`.
+- UX para produção: `--fail-fast`, `--continue-on-error`, `--only-format`.
 
 ## Opções úteis
 
@@ -50,7 +50,6 @@ python extract_images.py caminho/arquivo.pdf
 - `--recursive`: busca PDFs recursivamente se a entrada for diretório
 - `--fail-fast`: para no primeiro erro
 - `--continue-on-error`: continua em caso de erro
-- `--min-size`: ignora saídas menores que N bytes
 - `--only-format`: filtra formatos de saída (ex.: `jpg,png`)
 - `--report`: caminho base do relatório
 - `--report-format`: `json`, `csv` ou ambos (ex.: `json,csv`)

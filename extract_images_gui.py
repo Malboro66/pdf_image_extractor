@@ -66,21 +66,18 @@ class App(ttk.Frame):
         self.output_var = tk.StringVar(value=str(Path("imagens_extraidas").resolve()))
         self.prefix_var = tk.StringVar(value="imagem")
         self.engine_var = tk.StringVar(value="auto")
-        self.min_size_var = tk.StringVar(value="0")
         self.recursive_var = tk.BooleanVar(value=False)
         self.continue_var = tk.BooleanVar(value=True)
 
         self._row_path(card, 0, "Entrada (PDF ou pasta)", self.input_var, self._pick_input)
         self._row_path(card, 1, "Saída das imagens", self.output_var, self._pick_output)
         self._row_entry(card, 2, "Prefixo", self.prefix_var)
-        self._row_entry(card, 3, "Tamanho mínimo (bytes)", self.min_size_var)
-
-        ttk.Label(card, text="Engine", style="Label.TLabel").grid(row=4, column=0, sticky="w", pady=8)
+        ttk.Label(card, text="Engine", style="Label.TLabel").grid(row=3, column=0, sticky="w", pady=8)
         engine = ttk.Combobox(card, textvariable=self.engine_var, values=["auto", "pypdf", "fallback"], state="readonly")
-        engine.grid(row=4, column=1, sticky="ew", padx=(8, 8), pady=8)
+        engine.grid(row=3, column=1, sticky="ew", padx=(8, 8), pady=8)
 
-        ttk.Checkbutton(card, text="Processar subpastas (recursive)", variable=self.recursive_var).grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 2))
-        ttk.Checkbutton(card, text="Continuar em caso de erro", variable=self.continue_var).grid(row=6, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        ttk.Checkbutton(card, text="Processar subpastas (recursive)", variable=self.recursive_var).grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 2))
+        ttk.Checkbutton(card, text="Continuar em caso de erro", variable=self.continue_var).grid(row=5, column=0, columnspan=2, sticky="w", pady=(0, 8))
 
         actions = ttk.Frame(self, style="App.TFrame")
         actions.grid(row=3, column=0, sticky="ew", pady=(12, 8))
@@ -134,8 +131,6 @@ class App(ttk.Frame):
         try:
             input_path = Path(self.input_var.get().strip())
             output_dir = Path(self.output_var.get().strip())
-            min_size = int(self.min_size_var.get().strip() or "0")
-
             self.master.after(0, lambda: self._append_status(f"Iniciando processamento de: {input_path}"))
             records, code = run_extraction_job(
                 input_path=input_path,
@@ -143,7 +138,6 @@ class App(ttk.Frame):
                 prefix=self.prefix_var.get().strip() or "imagem",
                 recursive=self.recursive_var.get(),
                 continue_on_error=self.continue_var.get(),
-                min_size=min_size,
                 engine=self.engine_var.get(),
                 quiet=True,
             )
