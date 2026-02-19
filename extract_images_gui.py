@@ -273,11 +273,16 @@ class App(ttk.Frame):
         self.table.insert("", "end", values=(out, record.page or "-", ext, record.status, record.output_bytes, err[:120]))
 
     def _open_report(self) -> None:
-        target = self.last_report_base.with_suffix(".json")
-        if target.exists():
-            webbrowser.open(target.as_uri())
-        else:
+        target = self.last_report_base.with_suffix(".json").resolve()
+        if not target.exists():
             self._append_status("Relatório ainda não gerado.")
+            return
+
+        try:
+            webbrowser.open(target.as_uri())
+        except ValueError:
+            # Fallback defensivo para caminhos não resolvidos em algumas plataformas.
+            webbrowser.open(str(target))
 
     def _run_job(self) -> None:
         try:
