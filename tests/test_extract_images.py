@@ -1,9 +1,13 @@
+import json
 import tempfile
+import time
 import unittest
 import zlib
+from unittest import mock
 from pathlib import Path
 
 from extract_images import _apply_decode_transform, _raw_to_png, extract_from_pdf, run_extraction_job
+from pdf_image_extractor.core.models import ExtractionRecord
 
 
 def _write_pdf_with_image(path: Path, image_payload: bytes, image_dict: bytes) -> None:
@@ -85,8 +89,8 @@ class ExtractImagesTests(unittest.TestCase):
             out = tmp / "out"
             pdf.write_bytes(b"not-a-valid-pdf")
             records, errors = extract_from_pdf(pdf, out, "img", None, "fallback", True)
-            self.assertEqual(errors, 0)
-            self.assertEqual(records, [])
+            self.assertEqual(errors, 1)
+            self.assertTrue(any(r.status == "blocked_policy" for r in records))
 
     def test_decode_transform_avoids_negative(self) -> None:
         decoded = bytes([0])
@@ -106,6 +110,140 @@ class ExtractImagesTests(unittest.TestCase):
             )
             self.assertEqual(records, [])
             self.assertEqual(code, 2)
+
+    def test_run_extraction_job_timeout_sets_explicit_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            out = tmp / "out"
+            pdf = tmp / "slow.pdf"
+            img = b"\xff\xd8\xff\xd9"
+            dct = b"<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length 4 >>"
+            _write_pdf_with_image(pdf, img, dct)
+
+            records, code = run_extraction_job(
+                input_paths=[pdf],
+                output_dir=out,
+                engine="fallback",
+                quiet=True,
+                isolate_pdf_processing=True,
+                pdf_timeout_seconds=0,
+            )
+            self.assertEqual(code, 1)
+            self.assertTrue(any(r.status == "timeout" for r in records))
+
+    def test_run_extraction_job_invalid_signature_blocked_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            out = tmp / "out"
+            fake = tmp / "fake.pdf"
+            fake.write_bytes(b"NOTPDF")
+
+            records, code = run_extraction_job(
+                input_paths=[fake],
+                output_dir=out,
+                engine="fallback",
+                quiet=True,
+                isolate_pdf_processing=True,
+            )
+            self.assertEqual(code, 1)
+            self.assertTrue(any(r.status == "blocked_policy" for r in records))
+
+    def test_run_extraction_job_limit_images_blocked_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            out = tmp / "out"
+            pdf = tmp / "two_images.pdf"
+            img1 = b"<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length 4 >>\nstream\n\xff\xd8\xff\xd9\nendstream\nendobj\n"
+            img2 = b"<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length 4 >>\nstream\n\xff\xd8\xff\xd9\nendstream\nendobj\n"
+            data = b"%PDF-1.4\n" \
+                b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n" \
+                b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n" \
+                b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /XObject <</Im0 4 0 R /Im1 5 0 R>> >> /Contents 6 0 R >>\nendobj\n" \
+                b"4 0 obj\n" + img1 + \
+                b"5 0 obj\n" + img2 + \
+                b"6 0 obj\n<< /Length 35 >>\nstream\nq\n100 0 0 100 0 0 cm\n/Im0 Do\n/Im1 Do\nQ\nendstream\nendobj\n" \
+                b"xref\n0 7\n0000000000 65535 f \ntrailer << /Root 1 0 R /Size 7 >>\nstartxref\n0\n%%EOF\n"
+            pdf.write_bytes(data)
+
+            records, code = run_extraction_job(
+                input_paths=[pdf],
+                output_dir=out,
+                engine="fallback",
+                quiet=True,
+                isolate_pdf_processing=True,
+                max_images_per_pdf=1,
+            )
+            self.assertEqual(code, 1)
+            self.assertTrue(any(r.status == "blocked_policy" for r in records))
+
+    def test_fail_fast_cancels_pending_futures_and_marks_interrupted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            out = tmp / "out"
+            pdfs = []
+            for i in range(6):
+                pdf = tmp / f"{i:02d}.pdf"
+                pdf.write_bytes(b"%PDF-1.4\n%%EOF\n")
+                pdfs.append(pdf)
+
+            def fake_extract(pdf_path, cfg, engine):
+                if pdf_path.name == "00.pdf":
+                    rec = ExtractionRecord(cfg.schema_version, str(pdf_path), None, 0, None, "", None, None, None, None, 0, 0, "error", "boom", "fake", 0, "none")
+                    return [rec], 1
+                time.sleep(0.35)
+                rec = ExtractionRecord(cfg.schema_version, str(pdf_path), None, 0, None, "", None, None, None, None, 0, 0, "ok", None, "fake", 0, "none")
+                return [rec], 0
+
+            with mock.patch("pdf_image_extractor.core.pipeline.extract_from_pdf", side_effect=fake_extract):
+                started = time.perf_counter()
+                records, code = run_extraction_job(
+                    input_paths=pdfs,
+                    output_dir=out,
+                    engine="fallback",
+                    quiet=True,
+                    isolate_pdf_processing=False,
+                    fail_fast=True,
+                    max_workers=2,
+                )
+                elapsed = time.perf_counter() - started
+
+            self.assertEqual(code, 1)
+            self.assertLess(elapsed, 0.9)
+            self.assertTrue(any(getattr(r, "status", None) == "interrupted" for r in records))
+
+    def test_run_extraction_job_writes_structured_telemetry_and_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            out = tmp / "out"
+            pdf = tmp / "one.pdf"
+            img = b"\xff\xd8\xff\xd9"
+            dct = b"<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length 4 >>"
+            _write_pdf_with_image(pdf, img, dct)
+            telemetry = tmp / "telemetry.jsonl"
+            metrics = tmp / "metrics.json"
+
+            records, code = run_extraction_job(
+                input_paths=[pdf],
+                output_dir=out,
+                engine="fallback",
+                quiet=True,
+                isolate_pdf_processing=False,
+                telemetry_log_path=telemetry,
+                metrics_output_path=metrics,
+            )
+            self.assertEqual(code, 0)
+            self.assertTrue(telemetry.exists())
+            self.assertTrue(metrics.exists())
+
+            lines = [json.loads(line) for line in telemetry.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertTrue(any(item.get("event") == "job_started" for item in lines))
+            self.assertTrue(any(item.get("event") == "pdf_finished" for item in lines))
+            self.assertTrue(all("job_id" in item for item in lines))
+
+            payload = json.loads(metrics.read_text(encoding="utf-8"))
+            self.assertIn("job_id", payload)
+            self.assertIn("status_counts", payload)
+            self.assertIn("duration_ms", payload)
 
     def test_run_extraction_job_multiple_inputs_unique_names(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
