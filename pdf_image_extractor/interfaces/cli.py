@@ -22,6 +22,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--engine", choices=["auto", "pypdf", "fallback"], default="auto", help="Engine de parsing PDF.")
     p.add_argument("--quiet", action="store_true", help="Desativa progresso no terminal.")
     p.add_argument("--max-workers", type=int, default=4, help="Número máximo de workers para processamento concorrente.")
+    p.add_argument("--no-isolation", action="store_true", help="Desativa isolamento por processo (não recomendado para entradas não confiáveis).")
+    p.add_argument("--pdf-timeout", type=int, default=60, help="Timeout por PDF em segundos (isolamento habilitado).")
+    p.add_argument("--worker-memory-mb", type=int, default=1024, help="Limite de memória por worker em MB (Linux/resource).")
+    p.add_argument("--worker-cpu-seconds", type=int, default=120, help="Limite de CPU por worker em segundos (Linux/resource).")
+    p.add_argument("--max-pdf-size-mb", type=int, default=200, help="Tamanho máximo permitido por PDF em MB (0 desativa).")
+    p.add_argument("--max-pages-per-pdf", type=int, default=500, help="Máximo de páginas processadas por PDF (0 desativa).")
+    p.add_argument("--max-images-per-pdf", type=int, default=2000, help="Máximo de imagens processadas por PDF (0 desativa).")
+    p.add_argument("--max-output-mb-per-pdf", type=int, default=256, help="Máximo de bytes de saída gerados por PDF em MB (0 desativa).")
+    p.add_argument("--telemetry-log", type=Path, default=None, help="Arquivo JSONL para logs estruturados do job.")
+    p.add_argument("--metrics-output", type=Path, default=None, help="Arquivo JSON com métricas agregadas do job.")
     return p
 
 
@@ -44,6 +54,16 @@ def main() -> int:
         engine=args.engine,
         quiet=args.quiet,
         max_workers=args.max_workers,
+        isolate_pdf_processing=not args.no_isolation,
+        pdf_timeout_seconds=max(1, args.pdf_timeout),
+        worker_memory_limit_mb=(args.worker_memory_mb if args.worker_memory_mb > 0 else None),
+        worker_cpu_time_limit_seconds=(args.worker_cpu_seconds if args.worker_cpu_seconds > 0 else None),
+        max_pdf_size_mb=(args.max_pdf_size_mb if args.max_pdf_size_mb > 0 else None),
+        max_pages_per_pdf=(args.max_pages_per_pdf if args.max_pages_per_pdf > 0 else None),
+        max_images_per_pdf=(args.max_images_per_pdf if args.max_images_per_pdf > 0 else None),
+        max_output_bytes_per_pdf_mb=(args.max_output_mb_per_pdf if args.max_output_mb_per_pdf > 0 else None),
+        telemetry_log_path=args.telemetry_log,
+        metrics_output_path=args.metrics_output,
     )
     records, exit_code = run_extraction_job(cfg)
     if exit_code == 2:

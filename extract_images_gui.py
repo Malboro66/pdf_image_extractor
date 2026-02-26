@@ -12,7 +12,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from pdf_image_extractor.core.models import ExtractionConfig
-from pdf_image_extractor.core.pipeline import collect_pdfs_from_inputs, extract_from_pdf, resolve_engine, write_report
+from pdf_image_extractor.core.pipeline import JobOrchestrator, ProgressEmitter, collect_pdfs_from_inputs
 
 SETTINGS_PATH = Path.home() / ".pdf_image_extractor_gui.json"
 
@@ -285,6 +285,32 @@ class App(ttk.Frame):
             webbrowser.open(str(target))
 
     def _run_job(self) -> None:
+        class GuiEmitter(ProgressEmitter):
+            def __init__(self, app: "App", total: int):
+                self.app = app
+                self.total = total
+                self.start = time.perf_counter()
+
+            def on_pdf_started(self, pdf: Path, index: int, total: int) -> None:
+                return
+
+            def on_pdf_finished(self, pdf: Path, records, errors: int, index: int, total: int) -> None:
+                elapsed = time.perf_counter() - self.start
+                avg = elapsed / max(1, index)
+                eta = max(0.0, avg * (self.total - index))
+                progress = (index / max(1, self.total)) * 100.0
+
+                def _ui_update(local_records=records, i=index, p=progress, eta_s=eta):
+                    self.app.progress_var.set(p)
+                    self.app.progress_lbl.configure(text=f"{i}/{self.total} ({p:.1f}%) - ETA {eta_s:.1f}s")
+                    for r in local_records:
+                        self.app._insert_record(r)
+
+                self.app.master.after(0, _ui_update)
+
+            def on_error(self, pdf: Path | None, error: Exception | str) -> None:
+                self.app.master.after(0, lambda: self.app._append_status(f"Erro em {pdf or '-'}: {error}"))
+
         try:
             output_dir = Path(self.output_var.get().strip())
             max_workers = max(1, int(self.max_workers_var.get().strip() or "4"))
@@ -307,32 +333,9 @@ class App(ttk.Frame):
                 self.master.after(0, lambda: self._append_status("Nenhum PDF encontrado para processar."))
                 return
 
-            engine = resolve_engine(cfg.engine)
-            start = time.perf_counter()
-            all_records = []
-            total_errors = 0
-            total = len(pdfs)
-
-            for idx, pdf in enumerate(pdfs, start=1):
-                records, errors = extract_from_pdf(pdf, cfg, engine)
-                all_records.extend(records)
-                total_errors += errors
-                elapsed = time.perf_counter() - start
-                avg = elapsed / idx
-                eta = max(0.0, avg * (total - idx))
-                progress = (idx / total) * 100.0
-
-                def _ui_update(local_records=records, i=idx, p=progress, eta_s=eta):
-                    self.progress_var.set(p)
-                    self.progress_lbl.configure(text=f"{i}/{total} ({p:.1f}%) - ETA {eta_s:.1f}s")
-                    for r in local_records:
-                        self._insert_record(r)
-
-                self.master.after(0, _ui_update)
-                if errors and cfg.fail_fast:
-                    break
-
-            write_report(all_records, cfg.report, cfg.report_formats)
+            orchestrator = JobOrchestrator(cfg, progress_emitter=GuiEmitter(self, len(pdfs)))
+            all_records, code = orchestrator.run()
+            total_errors = 0 if code == 0 else sum(1 for r in all_records if r.status in {"error", "timeout", "blocked_policy"})
             extracted = sum(1 for r in all_records if r.status == "ok")
             skipped = sum(1 for r in all_records if r.status.startswith("skipped"))
             self.master.after(0, lambda: self._append_status(f"Concluído: extraídas={extracted}, ignoradas={skipped}, erros={total_errors}"))
