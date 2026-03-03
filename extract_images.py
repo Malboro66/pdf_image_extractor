@@ -101,6 +101,25 @@ def _extract_metadata(dictionary_bytes: bytes) -> dict[str, Any]:
     return values
 
 
+def _extract_declared_stream_length(dictionary_bytes: bytes) -> int | None:
+    pos = dictionary_bytes.find(b"/Length")
+    if pos == -1:
+        return None
+
+    after = dictionary_bytes[pos + len(b"/Length"):].lstrip()
+    if not after:
+        return None
+
+    indirect = re.match(rb"(\d+)\s+(\d+)\s+R\b", after)
+    if indirect:
+        return None
+
+    direct = re.match(rb"(\d+)\b", after)
+    if not direct:
+        return None
+    return int(direct.group(1))
+
+
 def _decode_stream(data: bytes, filters: list[str]) -> bytes:
     decoded = data
     for f in filters:
@@ -306,8 +325,17 @@ def _extract_with_fallback(pdf_path: Path) -> list[dict[str, Any]]:
         if endstream == -1:
             continue
 
-        raw = body[data_start:endstream].rstrip(b"\r\n")
         dictionary = body[:stream_pos]
+        declared_length = _extract_declared_stream_length(dictionary)
+        if declared_length is not None and data_start + declared_length <= len(body):
+            raw = body[data_start:data_start + declared_length]
+        else:
+            raw = body[data_start:endstream]
+            if raw.endswith(b"\r\n"):
+                raw = raw[:-2]
+            elif raw.endswith((b"\r", b"\n")):
+                raw = raw[:-1]
+
         filters = _extract_filters(dictionary)
         meta = _extract_metadata(dictionary)
 
@@ -460,10 +488,11 @@ def run_extraction_job(
     for idx, pdf in enumerate(pdfs, start=1):
         if not quiet:
             print(f"[{idx}/{len(pdfs)}] Processando: {pdf}")
+        batch_prefix = f"{prefix}_{idx:04d}" if len(pdfs) > 1 else prefix
         records, errors = extract_from_pdf(
             pdf,
             output_dir,
-            prefix,
+            batch_prefix,
             only_format,
             engine,
             effective_continue,

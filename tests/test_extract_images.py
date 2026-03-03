@@ -18,6 +18,22 @@ def _write_pdf_with_image(path: Path, image_payload: bytes, image_dict: bytes) -
 
 
 class ExtractImagesTests(unittest.TestCase):
+    def test_stream_payload_keeps_trailing_newline_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            pdf = tmp / "trail.pdf"
+            out = tmp / "out"
+            payload = b"ABC\r\n"
+            image_dict = b"<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length 5 >>"
+            _write_pdf_with_image(pdf, payload, image_dict)
+
+            records, errors = extract_from_pdf(pdf, out, "img", None, "fallback", True)
+            self.assertEqual(errors, 0)
+            ok = [r for r in records if r.status == "ok"]
+            self.assertEqual(len(ok), 1)
+            self.assertEqual(ok[0].source_bytes, len(payload))
+            self.assertEqual(Path(ok[0].output_file).read_bytes(), payload)
+
     def test_extract_dct_jpg(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp = Path(tmp_dir)
@@ -92,6 +108,33 @@ class ExtractImagesTests(unittest.TestCase):
             )
             self.assertEqual(records, [])
             self.assertEqual(code, 2)
+
+    def test_batch_mode_avoids_filename_collisions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            out = tmp / "out"
+            input_dir = tmp / "pdfs"
+            input_dir.mkdir()
+
+            img = b"\xff\xd8\xff\xd9"
+            image_dict = b"<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length 4 >>"
+            _write_pdf_with_image(input_dir / "a.pdf", img, image_dict)
+            _write_pdf_with_image(input_dir / "b.pdf", img, image_dict)
+
+            records, code = run_extraction_job(
+                input_path=input_dir,
+                output_dir=out,
+                prefix="imagem",
+                recursive=False,
+                engine="fallback",
+                quiet=True,
+            )
+
+            self.assertEqual(code, 0)
+            ok_outputs = [r.output_file for r in records if r.status == "ok" and r.output_file]
+            self.assertEqual(len(ok_outputs), 2)
+            self.assertEqual(len(set(ok_outputs)), 2)
+            self.assertEqual(len(list(out.glob("*.jpg"))), 2)
 
 
 if __name__ == "__main__":
