@@ -18,6 +18,31 @@ def _write_pdf_with_image(path: Path, image_payload: bytes, image_dict: bytes) -
 
 
 class ExtractImagesTests(unittest.TestCase):
+    def test_output_filenames_are_unique_across_multiple_pdfs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            source = tmp / "pdfs"
+            source.mkdir()
+            out = tmp / "out"
+
+            image_dict = b"<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length 4 >>"
+            _write_pdf_with_image(source / "a.pdf", b"\xff\xd8\xff\xd9", image_dict)
+            _write_pdf_with_image(source / "b.pdf", b"\xff\xd8\xff\xe0", image_dict)
+
+            records, code = run_extraction_job(
+                input_path=source,
+                output_dir=out,
+                prefix="img",
+                engine="fallback",
+                report=tmp / "report",
+            )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(len([r for r in records if r.status == "ok"]), 2)
+            files = sorted(out.glob("*.jpg"))
+            self.assertEqual(len(files), 2)
+            self.assertEqual(len({f.name for f in files}), 2)
+
     def test_extract_dct_jpg(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp = Path(tmp_dir)
@@ -64,6 +89,25 @@ class ExtractImagesTests(unittest.TestCase):
             self.assertEqual(errors, 0)
             self.assertTrue(any(r.status == "ok" for r in records))
             self.assertEqual(len(list(out.glob("*.png"))), 1)
+
+    def test_extract_with_endstream_inside_binary_uses_declared_length(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            pdf = tmp / "length.pdf"
+            out = tmp / "out"
+            marker = b"endstream"
+            raw = b"\x00\x01" + marker + b"\x02\x03"
+            image_dict = b"<< /Type /XObject /Subtype /Image /Length " + str(len(raw)).encode("ascii") + b" >>"
+            encoded = raw
+            _write_pdf_with_image(pdf, encoded, image_dict)
+
+            records, errors = extract_from_pdf(pdf, out, "img", {"bin"}, "fallback", True)
+            self.assertEqual(errors, 0)
+            ok_records = [r for r in records if r.status == "ok"]
+            self.assertEqual(len(ok_records), 1)
+            output = Path(ok_records[0].output_file or "")
+            self.assertTrue(output.exists())
+            self.assertEqual(output.read_bytes(), raw)
 
     def test_skip_text_like_image_mask(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
