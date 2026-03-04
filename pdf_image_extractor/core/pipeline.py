@@ -4,10 +4,11 @@ import csv
 import hashlib
 import json
 import multiprocessing
+import threading
 import time
 import uuid
 from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict
 from pathlib import Path
 from typing import Protocol
@@ -17,6 +18,20 @@ from pdf_image_extractor.adapters.engines.fallback import FallbackEngine
 from pdf_image_extractor.adapters.engines.pypdf_engine import PyPdfEngine
 from pdf_image_extractor.core.models import ExtractionConfig, ExtractionRecord
 from pdf_image_extractor.core.reconstruct import choose_output
+
+
+
+_MP_START_METHOD = "spawn"
+_MP_CONTEXT_LOCK = threading.Lock()
+_MP_CONTEXT: multiprocessing.context.BaseContext | None = None
+
+
+def _get_multiprocessing_context() -> multiprocessing.context.BaseContext:
+    global _MP_CONTEXT
+    with _MP_CONTEXT_LOCK:
+        if _MP_CONTEXT is None:
+            _MP_CONTEXT = multiprocessing.get_context(_MP_START_METHOD)
+        return _MP_CONTEXT
 
 
 class ProgressEmitter(Protocol):
@@ -224,38 +239,52 @@ def _extract_worker(pdf_path: Path, config: ExtractionConfig, queue: multiproces
 
 
 def _extract_in_subprocess(pdf_path: Path, config: ExtractionConfig) -> tuple[list[ExtractionRecord], int]:
-    queue: multiprocessing.Queue = multiprocessing.Queue(maxsize=1)
-    process = multiprocessing.Process(target=_extract_worker, args=(pdf_path, config, queue))
+    ctx = _get_multiprocessing_context()
+    queue = ctx.Queue(maxsize=1)
+    process = ctx.Process(target=_extract_worker, args=(pdf_path, config, queue))
     started = time.perf_counter()
     process.start()
     process.join(timeout=config.pdf_timeout_seconds)
 
-    if process.is_alive():
-        process.terminate()
-        process.join()
-        timeout_ms = int((time.perf_counter() - started) * 1000)
-        timeout_error = f"Timeout ao processar PDF (> {config.pdf_timeout_seconds}s)"
-        record = ExtractionRecord(config.schema_version, str(pdf_path), None, 0, None, "", None, None, None, None, 0, 0, "timeout", timeout_error, f"{config.engine}:isolated", timeout_ms, "none")
-        return [record], 1
-
-    if process.exitcode and process.exitcode != 0:
-        err = f"Worker finalizou com código {process.exitcode}"
-        record = ExtractionRecord(config.schema_version, str(pdf_path), None, 0, None, "", None, None, None, None, 0, 0, "error", err, f"{config.engine}:isolated", 0, "none")
-        return [record], 1
-
     try:
-        records, errors = queue.get_nowait()
-    except Exception:
-        err = "Worker finalizou sem retornar resultado"
-        record = ExtractionRecord(config.schema_version, str(pdf_path), None, 0, None, "", None, None, None, None, 0, 0, "error", err, f"{config.engine}:isolated", 0, "none")
-        return [record], 1
-    return records, errors
+        if process.is_alive():
+            process.terminate()
+            process.join()
+            timeout_ms = int((time.perf_counter() - started) * 1000)
+            timeout_error = f"Timeout ao processar PDF (> {config.pdf_timeout_seconds}s)"
+            record = ExtractionRecord(config.schema_version, str(pdf_path), None, 0, None, "", None, None, None, None, 0, 0, "timeout", timeout_error, f"{config.engine}:isolated", timeout_ms, "none")
+            return [record], 1
+
+        if process.exitcode and process.exitcode != 0:
+            err = f"Worker finalizou com código {process.exitcode}"
+            record = ExtractionRecord(config.schema_version, str(pdf_path), None, 0, None, "", None, None, None, None, 0, 0, "error", err, f"{config.engine}:isolated", 0, "none")
+            return [record], 1
+
+        try:
+            records, errors = queue.get_nowait()
+        except Exception:
+            err = "Worker finalizou sem retornar resultado"
+            record = ExtractionRecord(config.schema_version, str(pdf_path), None, 0, None, "", None, None, None, None, 0, 0, "error", err, f"{config.engine}:isolated", 0, "none")
+            return [record], 1
+        return records, errors
+    finally:
+        try:
+            queue.close()
+            queue.join_thread()
+        except Exception:
+            pass
 
 
 def extract_from_pdf(pdf_path: Path, config: ExtractionConfig, engine: ExtractorEngine | None = None) -> tuple[list[ExtractionRecord], int]:
     if config.isolate_pdf_processing:
         return _extract_in_subprocess(pdf_path, config)
     worker_engine = engine or resolve_engine(config.engine)
+    return _extract_impl(pdf_path, config, worker_engine)
+
+
+def _extract_from_pdf_nonisolated_worker(pdf_path: Path, config: ExtractionConfig) -> tuple[list[ExtractionRecord], int]:
+    # Worker top-level para ser serializável no ProcessPoolExecutor (spawn).
+    worker_engine = resolve_engine(config.engine)
     return _extract_impl(pdf_path, config, worker_engine)
 
 
@@ -345,14 +374,15 @@ class JobOrchestrator:
                     break
         else:
             max_workers = max(1, min(self.config.max_workers, len(pdfs)))
-            executor = ThreadPoolExecutor(max_workers=max_workers)
+            mp_ctx = _get_multiprocessing_context()
+            executor = ProcessPoolExecutor(max_workers=max_workers, mp_context=mp_ctx)
             interrupted = False
             try:
                 futures = {}
                 for i, pdf in enumerate(pdfs, start=1):
                     start_by_pdf[pdf] = time.perf_counter()
                     self.progress.on_pdf_started(pdf, i, len(pdfs))
-                    futures[executor.submit(extract_from_pdf, pdf, self.config, engine)] = (pdf, i)
+                    futures[executor.submit(_extract_from_pdf_nonisolated_worker, pdf, self.config)] = (pdf, i)
 
                 for fut in as_completed(futures):
                     pdf, i = futures[fut]
