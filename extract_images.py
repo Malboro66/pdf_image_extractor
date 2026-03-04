@@ -21,6 +21,7 @@ COLORSPACE_RE = re.compile(rb"/ColorSpace\s*/([A-Za-z0-9]+)")
 DECODE_RE = re.compile(rb"/Decode\s*\[(.*?)\]", re.DOTALL)
 FLOAT_RE = re.compile(rb"-?\d+(?:\.\d+)?")
 SUBTYPE_IMAGE_RE = re.compile(rb"/Subtype\s*/Image")
+LENGTH_RE = re.compile(rb"/Length\s+(\d+)")
 
 
 @dataclass
@@ -303,12 +304,20 @@ def _extract_with_fallback(pdf_path: Path) -> list[dict[str, Any]]:
         elif body[data_start:data_start + 1] in {b"\r", b"\n"}:
             data_start += 1
 
-        endstream = body.find(b"endstream", data_start)
-        if endstream == -1:
-            continue
-
-        raw = body[data_start:endstream].rstrip(b"\r\n")
         dictionary = body[:stream_pos]
+        length_match = LENGTH_RE.search(dictionary)
+        if length_match:
+            stream_len = int(length_match.group(1))
+            data_end = data_start + stream_len
+            if data_end > len(body):
+                continue
+            raw = body[data_start:data_end]
+        else:
+            endstream = body.find(b"endstream", data_start)
+            if endstream == -1:
+                continue
+            raw = body[data_start:endstream].rstrip(b"\r\n")
+
         filters = _extract_filters(dictionary)
         meta = _extract_metadata(dictionary)
 
@@ -368,8 +377,12 @@ def extract_from_pdf(
                 out_file = None
                 out_size = 0
             else:
-                name = f"{prefix}_{item['index']:04d}.{ext}"
-                target = output_dir / name
+                base_name = f"{prefix}_{item['index']:04d}"
+                target = output_dir / f"{base_name}.{ext}"
+                suffix = 1
+                while target.exists():
+                    target = output_dir / f"{base_name}_{suffix:03d}.{ext}"
+                    suffix += 1
                 target.write_bytes(decoded)
                 status = "ok"
                 out_file = str(target)
