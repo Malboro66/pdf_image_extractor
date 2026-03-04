@@ -3,8 +3,11 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import logging
 import multiprocessing
-import threading
+import shutil
+import sys
+import tempfile
 import time
 import uuid
 from collections import Counter, defaultdict
@@ -18,6 +21,56 @@ from pdf_image_extractor.adapters.engines.fallback import FallbackEngine
 from pdf_image_extractor.adapters.engines.pypdf_engine import PyPdfEngine
 from pdf_image_extractor.core.models import ExtractionConfig, ExtractionRecord
 from pdf_image_extractor.core.reconstruct import choose_output
+
+LOGGER_NAME = "pdf_image_extractor"
+
+
+class _MaxLevelFilter(logging.Filter):
+    def __init__(self, max_level: int) -> None:
+        super().__init__()
+        self.max_level = max_level
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno <= self.max_level
+
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload = getattr(record, "payload", {})
+        row = {
+            "level": record.levelname,
+            "event": getattr(record, "event", record.getMessage()),
+            "job_id": getattr(record, "job_id", "-"),
+            **payload,
+        }
+        return json.dumps(row, ensure_ascii=False)
+
+
+def _get_structured_logger() -> logging.Logger:
+    logger = logging.getLogger(LOGGER_NAME)
+    if getattr(logger, "_pdf_image_extractor_configured", False):
+        return logger
+
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    formatter = JsonFormatter()
+
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setLevel(logging.INFO)
+    stdout_handler.addFilter(_MaxLevelFilter(logging.WARNING))
+    stdout_handler.setFormatter(formatter)
+
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setLevel(logging.ERROR)
+    stderr_handler.setFormatter(formatter)
+
+    logger.addHandler(stdout_handler)
+    logger.addHandler(stderr_handler)
+    logger._pdf_image_extractor_configured = True
+    return logger
+
+
+LOGGER = _get_structured_logger()
 
 
 
@@ -61,7 +114,14 @@ class StdoutProgressEmitter(NullProgressEmitter):
         self.job_id = job_id
 
     def on_pdf_started(self, pdf: Path, index: int, total: int) -> None:
-        print(json.dumps({"level": "INFO", "event": "pdf_started", "job_id": self.job_id, "pdf_path": str(pdf), "index": index, "total": total}, ensure_ascii=False))
+        LOGGER.info(
+            "pdf_started",
+            extra={
+                "event": "pdf_started",
+                "job_id": self.job_id,
+                "payload": {"pdf_path": str(pdf), "index": index, "total": total},
+            },
+        )
 
 
 class ReportWriter:
@@ -170,7 +230,12 @@ def _set_resource_limits(config: ExtractionConfig) -> None:
                 pass
 
 
-def _extract_impl(pdf_path: Path, config: ExtractionConfig, engine: ExtractorEngine) -> tuple[list[ExtractionRecord], int]:
+def _extract_impl(
+    pdf_path: Path,
+    config: ExtractionConfig,
+    engine: ExtractorEngine,
+    output_dir: Path | None = None,
+) -> tuple[list[ExtractionRecord], int]:
     records: list[ExtractionRecord] = []
     errors = 0
 
@@ -183,7 +248,8 @@ def _extract_impl(pdf_path: Path, config: ExtractionConfig, engine: ExtractorEng
     except Exception as exc:
         return [ExtractionRecord(config.schema_version, str(pdf_path), None, 0, None, "", None, None, None, None, 0, 0, "error", str(exc), engine.name, 0, "none")], 1
 
-    config.output_dir.mkdir(parents=True, exist_ok=True)
+    effective_output_dir = output_dir or config.output_dir
+    effective_output_dir.mkdir(parents=True, exist_ok=True)
     seen_pages: set[int] = set()
     processed_images = 0
     output_bytes_total = 0
@@ -214,7 +280,7 @@ def _extract_impl(pdf_path: Path, config: ExtractionConfig, engine: ExtractorEng
                     errors += 1
                     break
                 name = _build_output_name(config, pdf_path, item.page, item.index, ext, item.raw)
-                target = config.output_dir / name
+                target = effective_output_dir / name
                 target.write_bytes(decoded)
                 status, out_file, out_size = "ok", str(target), len(decoded)
                 output_bytes_total += out_size
@@ -229,50 +295,94 @@ def _extract_impl(pdf_path: Path, config: ExtractionConfig, engine: ExtractorEng
     return records, errors
 
 
-def _extract_worker(pdf_path: Path, config: ExtractionConfig, queue: multiprocessing.Queue) -> None:
+def _extract_worker(
+    pdf_path: Path,
+    config: ExtractionConfig,
+    queue: multiprocessing.Queue,
+    isolated_output_dir: str | None = None,
+) -> None:
     try:
         _set_resource_limits(config)
         engine = resolve_engine(config.engine)
-        queue.put(_extract_impl(pdf_path, config, engine))
+        output_dir = Path(isolated_output_dir) if isolated_output_dir else None
+        queue.put(_extract_impl(pdf_path, config, engine, output_dir=output_dir))
     except Exception as exc:
         queue.put(([ExtractionRecord(config.schema_version, str(pdf_path), None, 0, None, "", None, None, None, None, 0, 0, "error", f"Worker exception: {exc}", f"{config.engine}:isolated", 0, "none")], 1))
 
 
 def _extract_in_subprocess(pdf_path: Path, config: ExtractionConfig) -> tuple[list[ExtractionRecord], int]:
-    ctx = _get_multiprocessing_context()
-    queue = ctx.Queue(maxsize=1)
-    process = ctx.Process(target=_extract_worker, args=(pdf_path, config, queue))
+    queue: multiprocessing.Queue = multiprocessing.Queue(maxsize=1)
+    isolated_tmp_dir = Path(tempfile.mkdtemp(prefix="pdf-image-extractor-"))
+    process = multiprocessing.Process(
+        target=_extract_worker,
+        args=(pdf_path, config, queue, str(isolated_tmp_dir)),
+    )
     started = time.perf_counter()
     process.start()
     process.join(timeout=config.pdf_timeout_seconds)
 
+    if process.is_alive():
+        process.terminate()
+        process.join()
+        shutil.rmtree(isolated_tmp_dir, ignore_errors=True)
+        timeout_ms = int((time.perf_counter() - started) * 1000)
+        timeout_error = f"Timeout ao processar PDF (> {config.pdf_timeout_seconds}s)"
+        record = ExtractionRecord(config.schema_version, str(pdf_path), None, 0, None, "", None, None, None, None, 0, 0, "timeout", timeout_error, f"{config.engine}:isolated", timeout_ms, "none")
+        return [record], 1
+
+    if process.exitcode and process.exitcode != 0:
+        shutil.rmtree(isolated_tmp_dir, ignore_errors=True)
+        err = f"Worker finalizou com código {process.exitcode}"
+        record = ExtractionRecord(config.schema_version, str(pdf_path), None, 0, None, "", None, None, None, None, 0, 0, "error", err, f"{config.engine}:isolated", 0, "none")
+        return [record], 1
+
     try:
-        if process.is_alive():
-            process.terminate()
-            process.join()
-            timeout_ms = int((time.perf_counter() - started) * 1000)
-            timeout_error = f"Timeout ao processar PDF (> {config.pdf_timeout_seconds}s)"
-            record = ExtractionRecord(config.schema_version, str(pdf_path), None, 0, None, "", None, None, None, None, 0, 0, "timeout", timeout_error, f"{config.engine}:isolated", timeout_ms, "none")
-            return [record], 1
+        records, errors = queue.get_nowait()
+    except Exception:
+        shutil.rmtree(isolated_tmp_dir, ignore_errors=True)
+        err = "Worker finalizou sem retornar resultado"
+        record = ExtractionRecord(config.schema_version, str(pdf_path), None, 0, None, "", None, None, None, None, 0, 0, "error", err, f"{config.engine}:isolated", 0, "none")
+        return [record], 1
 
-        if process.exitcode and process.exitcode != 0:
-            err = f"Worker finalizou com código {process.exitcode}"
-            record = ExtractionRecord(config.schema_version, str(pdf_path), None, 0, None, "", None, None, None, None, 0, 0, "error", err, f"{config.engine}:isolated", 0, "none")
-            return [record], 1
+    moved_paths: dict[str, str] = {}
+    try:
+        config.output_dir.mkdir(parents=True, exist_ok=True)
+        for src in isolated_tmp_dir.iterdir():
+            target = config.output_dir / src.name
+            moved = Path(shutil.move(str(src), target))
+            moved_paths[str(src)] = str(moved)
+    except Exception as exc:
+        shutil.rmtree(isolated_tmp_dir, ignore_errors=True)
+        err = f"Falha ao consolidar artefatos isolados: {exc}"
+        record = ExtractionRecord(config.schema_version, str(pdf_path), None, 0, None, "", None, None, None, None, 0, 0, "error", err, f"{config.engine}:isolated", 0, "none")
+        return [record], 1
 
-        try:
-            records, errors = queue.get_nowait()
-        except Exception:
-            err = "Worker finalizou sem retornar resultado"
-            record = ExtractionRecord(config.schema_version, str(pdf_path), None, 0, None, "", None, None, None, None, 0, 0, "error", err, f"{config.engine}:isolated", 0, "none")
-            return [record], 1
-        return records, errors
-    finally:
-        try:
-            queue.close()
-            queue.join_thread()
-        except Exception:
-            pass
+    shutil.rmtree(isolated_tmp_dir, ignore_errors=True)
+
+    normalized_records: list[ExtractionRecord] = []
+    for r in records:
+        normalized_records.append(
+            ExtractionRecord(
+                r.schema_version,
+                r.input_file,
+                r.page,
+                r.image_index,
+                moved_paths.get(r.output_file, r.output_file) if r.output_file else None,
+                r.filters,
+                r.width,
+                r.height,
+                r.bits_per_component,
+                r.color_space,
+                r.source_bytes,
+                r.output_bytes,
+                r.status,
+                r.error,
+                r.engine_used,
+                r.duration_ms,
+                r.correction_status,
+            )
+        )
+    return normalized_records, errors
 
 
 def extract_from_pdf(pdf_path: Path, config: ExtractionConfig, engine: ExtractorEngine | None = None) -> tuple[list[ExtractionRecord], int]:
@@ -307,8 +417,13 @@ class JobOrchestrator:
 
     def _log(self, *, level: str, event: str, payload: dict) -> None:
         row = {"level": level, "event": event, "job_id": self.job_id, **payload}
-        if not self.config.quiet:
-            print(json.dumps(row, ensure_ascii=False))
+        level_no = getattr(logging, level.upper(), logging.INFO)
+        if (not self.config.quiet) or level_no >= logging.ERROR:
+            LOGGER.log(
+                level_no,
+                event,
+                extra={"event": event, "job_id": self.job_id, "payload": payload},
+            )
         if self.config.telemetry_log_path:
             self.config.telemetry_log_path.parent.mkdir(parents=True, exist_ok=True)
             with self.config.telemetry_log_path.open("a", encoding="utf-8") as fh:

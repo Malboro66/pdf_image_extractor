@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, get_args
 
@@ -40,8 +40,8 @@ class ExtractionConfig:
     continue_on_error: bool = False
     only_format: set[str] | None = None
     report: Path = Path("relatorio_extracao")
-    report_formats: set[ReportFormat] = frozenset({"json", "csv"})
-    engine: EngineName = "auto"
+    report_formats: set[str] = field(default_factory=lambda: {"json", "csv"})
+    engine: str = "auto"
     quiet: bool = False
     schema_version: str = "1.1"
     max_workers: int = 4

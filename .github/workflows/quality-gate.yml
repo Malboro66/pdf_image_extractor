@@ -41,5 +41,11 @@ jobs:
         run: |
           pytest --cov=pdf_image_extractor --cov=extract_images --cov-report=term-missing --cov-fail-under=80
 
+      - name: Mutation testing gate
+        if: matrix.python-version == '3.11'
+        run: |
+          mutmut run --paths-to-mutate pdf_image_extractor/core --runner "python -m pytest tests -q"
+          python scripts/check_mutmut_score.py --min-score 70
+
       - name: Dependency audit
         run: pip-audit -r requirements-ci.txt
