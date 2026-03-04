@@ -11,7 +11,7 @@ import tempfile
 import time
 import uuid
 from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict
 from pathlib import Path
 from typing import Protocol
@@ -71,6 +71,20 @@ def _get_structured_logger() -> logging.Logger:
 
 
 LOGGER = _get_structured_logger()
+
+
+
+_MP_START_METHOD = "spawn"
+_MP_CONTEXT_LOCK = threading.Lock()
+_MP_CONTEXT: multiprocessing.context.BaseContext | None = None
+
+
+def _get_multiprocessing_context() -> multiprocessing.context.BaseContext:
+    global _MP_CONTEXT
+    with _MP_CONTEXT_LOCK:
+        if _MP_CONTEXT is None:
+            _MP_CONTEXT = multiprocessing.get_context(_MP_START_METHOD)
+        return _MP_CONTEXT
 
 
 class ProgressEmitter(Protocol):
@@ -378,6 +392,12 @@ def extract_from_pdf(pdf_path: Path, config: ExtractionConfig, engine: Extractor
     return _extract_impl(pdf_path, config, worker_engine)
 
 
+def _extract_from_pdf_nonisolated_worker(pdf_path: Path, config: ExtractionConfig) -> tuple[list[ExtractionRecord], int]:
+    # Worker top-level para ser serializável no ProcessPoolExecutor (spawn).
+    worker_engine = resolve_engine(config.engine)
+    return _extract_impl(pdf_path, config, worker_engine)
+
+
 def _percentile(values: list[int], pct: float) -> float:
     if not values:
         return 0.0
@@ -469,14 +489,15 @@ class JobOrchestrator:
                     break
         else:
             max_workers = max(1, min(self.config.max_workers, len(pdfs)))
-            executor = ThreadPoolExecutor(max_workers=max_workers)
+            mp_ctx = _get_multiprocessing_context()
+            executor = ProcessPoolExecutor(max_workers=max_workers, mp_context=mp_ctx)
             interrupted = False
             try:
                 futures = {}
                 for i, pdf in enumerate(pdfs, start=1):
                     start_by_pdf[pdf] = time.perf_counter()
                     self.progress.on_pdf_started(pdf, i, len(pdfs))
-                    futures[executor.submit(extract_from_pdf, pdf, self.config, engine)] = (pdf, i)
+                    futures[executor.submit(_extract_from_pdf_nonisolated_worker, pdf, self.config)] = (pdf, i)
 
                 for fut in as_completed(futures):
                     pdf, i = futures[fut]

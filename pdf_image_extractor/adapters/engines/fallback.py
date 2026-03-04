@@ -7,7 +7,7 @@ from pathlib import Path
 from pdf_image_extractor.adapters.engines.base import ParsedImage
 from pdf_image_extractor.core.decoders import decode_stream
 
-OBJ_RE = re.compile(rb"(\d+)\s+(\d+)\s+obj(.*?)endobj", re.DOTALL)
+OBJ_HEADER_RE = re.compile(rb"\d+\s+\d+\s+obj")
 FILTER_NAME_RE = re.compile(rb"/([A-Za-z0-9]+)")
 NUMBER_RE = re.compile(rb"/(Width|Height|BitsPerComponent)\s+(\d+)")
 COLORSPACE_RE = re.compile(rb"/ColorSpace\s*/([A-Za-z0-9]+)")
@@ -18,6 +18,68 @@ SUBTYPE_IMAGE_RE = re.compile(rb"/Subtype\s*/Image")
 
 class FallbackEngine:
     name = "fallback"
+    CHUNK_SIZE = 1024 * 1024
+    MAX_OBJECT_BYTES = 64 * 1024 * 1024
+
+    @classmethod
+    def _find_object_header(cls, buf: bytearray, start: int) -> tuple[int, int] | None:
+        pos = start
+        while True:
+            marker = buf.find(b" obj", pos)
+            if marker == -1:
+                return None
+            line_start = max(buf.rfind(b"\n", 0, marker), buf.rfind(b"\r", 0, marker)) + 1
+            candidate = bytes(buf[line_start:marker + len(b" obj")]).strip()
+            if OBJ_HEADER_RE.fullmatch(candidate):
+                return line_start, marker + len(b" obj")
+            pos = marker + len(b" obj")
+
+    @classmethod
+    def _iter_object_bodies(cls, pdf_path: Path):
+        with pdf_path.open("rb") as f:
+            buf = bytearray()
+            cursor = 0
+            eof = False
+            while True:
+                if not eof and len(buf) - cursor < cls.CHUNK_SIZE:
+                    chunk = f.read(cls.CHUNK_SIZE)
+                    if chunk:
+                        buf.extend(chunk)
+                    else:
+                        eof = True
+
+                progressed = False
+                while True:
+                    header = cls._find_object_header(buf, cursor)
+                    if header is None:
+                        break
+
+                    obj_start, body_start = header
+                    endobj = buf.find(b"endobj", body_start)
+                    if endobj == -1:
+                        if len(buf) - obj_start > cls.MAX_OBJECT_BYTES:
+                            cursor = body_start
+                            progressed = True
+                            continue
+                        if obj_start > 0:
+                            del buf[:obj_start]
+                            cursor = 0
+                            progressed = True
+                        break
+
+                    yield bytes(buf[body_start:endobj])
+                    cursor = endobj + len(b"endobj")
+                    progressed = True
+
+                if cursor > 0 and (cursor > cls.CHUNK_SIZE or (eof and cursor == len(buf))):
+                    del buf[:cursor]
+                    cursor = 0
+
+                if eof:
+                    if not progressed:
+                        break
+                    if not buf:
+                        break
 
     @staticmethod
     def _extract_filters(dictionary_bytes: bytes) -> list[str]:
@@ -90,11 +152,9 @@ class FallbackEngine:
         return False
 
     def extract(self, pdf_path: Path) -> list[ParsedImage]:
-        pdf_bytes = pdf_path.read_bytes()
         images: list[ParsedImage] = []
         idx = 0
-        for match in OBJ_RE.finditer(pdf_bytes):
-            body = match.group(3)
+        for body in self._iter_object_bodies(pdf_path):
             if not SUBTYPE_IMAGE_RE.search(body) or b"stream" not in body:
                 continue
             stream_pos = body.find(b"stream")

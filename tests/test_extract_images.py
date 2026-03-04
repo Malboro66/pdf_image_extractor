@@ -3,10 +3,13 @@ import tempfile
 import time
 import unittest
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 from pathlib import Path
 
 from extract_images import _apply_decode_transform, _raw_to_png, extract_from_pdf, run_extraction_job
+from pdf_image_extractor.adapters.engines.fallback import FallbackEngine
+from pdf_image_extractor.core import pipeline
 from pdf_image_extractor.core.models import ExtractionRecord
 
 
@@ -81,6 +84,67 @@ class ExtractImagesTests(unittest.TestCase):
             records, errors = extract_from_pdf(pdf, out, "img", None, "fallback", True)
             self.assertEqual(errors, 0)
             self.assertEqual(records, [])
+
+
+    def test_fallback_skips_oversized_unclosed_object_and_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            pdf = tmp / "oversized_unclosed.pdf"
+            out = tmp / "out"
+            img = b"\xff\xd8\xff\xd9"
+            dct = b"<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length 4 >>"
+            oversized = b"A" * 2048
+            data = (
+                b"%PDF-1.4\n"
+                b"1 0 obj\n<< /Length 4096 >>\nstream\n" + oversized + b"\n"
+                b"2 0 obj\n" + dct + b"\nstream\n" + img + b"\nendstream\nendobj\n"
+                b"xref\n0 3\n0000000000 65535 f \ntrailer << /Root 1 0 R /Size 3 >>\nstartxref\n0\n%%EOF\n"
+            )
+            pdf.write_bytes(data)
+
+            with mock.patch.object(FallbackEngine, "MAX_OBJECT_BYTES", 1024):
+                records, errors = extract_from_pdf(pdf, out, "img", None, "fallback", True)
+
+            self.assertEqual(errors, 0)
+            self.assertTrue(any(r.status == "ok" for r in records))
+            self.assertGreaterEqual(len(list(out.glob("*"))), 1)
+
+
+    def test_get_multiprocessing_context_cached_and_spawn(self) -> None:
+        with mock.patch("pdf_image_extractor.core.pipeline._MP_CONTEXT", None):
+            with mock.patch("pdf_image_extractor.core.pipeline.multiprocessing.get_context") as get_ctx:
+                sentinel = object()
+                get_ctx.return_value = sentinel
+
+                ctx1 = pipeline._get_multiprocessing_context()
+                ctx2 = pipeline._get_multiprocessing_context()
+
+            self.assertIs(ctx1, sentinel)
+            self.assertIs(ctx2, sentinel)
+            get_ctx.assert_called_once_with("spawn")
+
+    def test_extract_in_subprocess_uses_context_process_and_bounded_queue(self) -> None:
+        cfg = pipeline.ExtractionConfig(input_paths=[], output_dir=Path("."), engine="fallback", isolate_pdf_processing=True)
+        fake_queue = mock.Mock()
+        fake_process = mock.Mock()
+        fake_process.is_alive.return_value = False
+        fake_process.exitcode = 0
+        fake_queue.get_nowait.return_value = ([], 0)
+        fake_ctx = mock.Mock()
+        fake_ctx.Queue.return_value = fake_queue
+        fake_ctx.Process.return_value = fake_process
+
+        with mock.patch("pdf_image_extractor.core.pipeline._get_multiprocessing_context", return_value=fake_ctx):
+            records, errors = pipeline._extract_in_subprocess(Path("dummy.pdf"), cfg)
+
+        self.assertEqual(records, [])
+        self.assertEqual(errors, 0)
+        fake_ctx.Queue.assert_called_once_with(maxsize=1)
+        fake_ctx.Process.assert_called_once()
+        fake_process.start.assert_called_once()
+        fake_process.join.assert_called()
+        fake_queue.close.assert_called_once()
+        fake_queue.join_thread.assert_called_once()
 
     def test_corrupted_pdf(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -186,7 +250,7 @@ class ExtractImagesTests(unittest.TestCase):
                 pdf.write_bytes(b"%PDF-1.4\n%%EOF\n")
                 pdfs.append(pdf)
 
-            def fake_extract(pdf_path, cfg, engine):
+            def fake_worker(pdf_path, cfg):
                 if pdf_path.name == "00.pdf":
                     rec = ExtractionRecord(cfg.schema_version, str(pdf_path), None, 0, None, "", None, None, None, None, 0, 0, "error", "boom", "fake", 0, "none")
                     return [rec], 1
@@ -194,18 +258,29 @@ class ExtractImagesTests(unittest.TestCase):
                 rec = ExtractionRecord(cfg.schema_version, str(pdf_path), None, 0, None, "", None, None, None, None, 0, 0, "ok", None, "fake", 0, "none")
                 return [rec], 0
 
-            with mock.patch("pdf_image_extractor.core.pipeline.extract_from_pdf", side_effect=fake_extract):
-                started = time.perf_counter()
-                records, code = run_extraction_job(
-                    input_paths=pdfs,
-                    output_dir=out,
-                    engine="fallback",
-                    quiet=True,
-                    isolate_pdf_processing=False,
-                    fail_fast=True,
-                    max_workers=2,
-                )
-                elapsed = time.perf_counter() - started
+            class FakeProcessPoolExecutor:
+                def __init__(self, max_workers, mp_context):
+                    self._executor = ThreadPoolExecutor(max_workers=max_workers)
+
+                def submit(self, fn, *args, **kwargs):
+                    return self._executor.submit(fn, *args, **kwargs)
+
+                def shutdown(self, wait=True, cancel_futures=False):
+                    self._executor.shutdown(wait=wait, cancel_futures=cancel_futures)
+
+            with mock.patch("pdf_image_extractor.core.pipeline._extract_from_pdf_nonisolated_worker", side_effect=fake_worker):
+                with mock.patch("pdf_image_extractor.core.pipeline.ProcessPoolExecutor", FakeProcessPoolExecutor):
+                    started = time.perf_counter()
+                    records, code = run_extraction_job(
+                        input_paths=pdfs,
+                        output_dir=out,
+                        engine="fallback",
+                        quiet=True,
+                        isolate_pdf_processing=False,
+                        fail_fast=True,
+                        max_workers=2,
+                    )
+                    elapsed = time.perf_counter() - started
 
             self.assertEqual(code, 1)
             self.assertLess(elapsed, 0.9)
