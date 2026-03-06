@@ -123,6 +123,18 @@ class ExtractImagesTests(unittest.TestCase):
             self.assertIs(ctx2, sentinel)
             get_ctx.assert_called_once_with("spawn")
 
+    def test_get_multiprocessing_context_thread_safe_single_init(self) -> None:
+        with mock.patch("pdf_image_extractor.core.pipeline._MP_CONTEXT", None):
+            with mock.patch("pdf_image_extractor.core.pipeline.multiprocessing.get_context") as get_ctx:
+                sentinel = object()
+                get_ctx.return_value = sentinel
+
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    contexts = list(pool.map(lambda _: pipeline._get_multiprocessing_context(), range(32)))
+
+            self.assertTrue(all(ctx is sentinel for ctx in contexts))
+            get_ctx.assert_called_once_with("spawn")
+
     def test_extract_in_subprocess_uses_context_process_and_bounded_queue(self) -> None:
         cfg = pipeline.ExtractionConfig(input_paths=[], output_dir=Path("."), engine="fallback", isolate_pdf_processing=True)
         fake_queue = mock.Mock()
@@ -143,6 +155,30 @@ class ExtractImagesTests(unittest.TestCase):
         fake_ctx.Process.assert_called_once()
         fake_process.start.assert_called_once()
         fake_process.join.assert_called()
+        fake_queue.close.assert_called_once()
+        fake_queue.join_thread.assert_called_once()
+
+    def test_extract_in_subprocess_timeout_still_closes_queue(self) -> None:
+        cfg = pipeline.ExtractionConfig(
+            input_paths=[],
+            output_dir=Path("."),
+            engine="fallback",
+            isolate_pdf_processing=True,
+            pdf_timeout_seconds=1,
+        )
+        fake_queue = mock.Mock()
+        fake_process = mock.Mock()
+        fake_process.is_alive.return_value = True
+        fake_process.exitcode = None
+        fake_ctx = mock.Mock()
+        fake_ctx.Queue.return_value = fake_queue
+        fake_ctx.Process.return_value = fake_process
+
+        with mock.patch("pdf_image_extractor.core.pipeline._get_multiprocessing_context", return_value=fake_ctx):
+            records, errors = pipeline._extract_in_subprocess(Path("dummy.pdf"), cfg)
+
+        self.assertEqual(errors, 1)
+        self.assertEqual(records[0].status, "timeout")
         fake_queue.close.assert_called_once()
         fake_queue.join_thread.assert_called_once()
 
