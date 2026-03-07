@@ -8,6 +8,7 @@ import multiprocessing
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from collections import Counter, defaultdict
@@ -80,10 +81,15 @@ _MP_CONTEXT: multiprocessing.context.BaseContext | None = None
 
 
 def _get_multiprocessing_context() -> multiprocessing.context.BaseContext:
-    global _MP_CONTEXT
+    # Primeiro check (lock-free): caminho rápido para leituras após inicialização.
+    if _MP_CONTEXT is not None:
+        return _MP_CONTEXT
+
+    # Se ainda não inicializado, entra na região crítica para evitar corrida.
     with _MP_CONTEXT_LOCK:
+        # Segundo check (protegido): garante inicialização única sob concorrência.
         if _MP_CONTEXT is None:
-            _MP_CONTEXT = multiprocessing.get_context(_MP_START_METHOD)
+            globals()["_MP_CONTEXT"] = multiprocessing.get_context(_MP_START_METHOD)
         return _MP_CONTEXT
 
 
@@ -311,78 +317,94 @@ def _extract_worker(
 
 
 def _extract_in_subprocess(pdf_path: Path, config: ExtractionConfig) -> tuple[list[ExtractionRecord], int]:
-    queue: multiprocessing.Queue = multiprocessing.Queue(maxsize=1)
+    mp_ctx = _get_multiprocessing_context()
+    queue = mp_ctx.Queue(maxsize=1)
     isolated_tmp_dir = Path(tempfile.mkdtemp(prefix="pdf-image-extractor-"))
-    process = multiprocessing.Process(
+    process = mp_ctx.Process(
         target=_extract_worker,
         args=(pdf_path, config, queue, str(isolated_tmp_dir)),
     )
-    started = time.perf_counter()
-    process.start()
-    process.join(timeout=config.pdf_timeout_seconds)
-
-    if process.is_alive():
-        process.terminate()
-        process.join()
-        shutil.rmtree(isolated_tmp_dir, ignore_errors=True)
-        timeout_ms = int((time.perf_counter() - started) * 1000)
-        timeout_error = f"Timeout ao processar PDF (> {config.pdf_timeout_seconds}s)"
-        record = ExtractionRecord(config.schema_version, str(pdf_path), None, 0, None, "", None, None, None, None, 0, 0, "timeout", timeout_error, f"{config.engine}:isolated", timeout_ms, "none")
-        return [record], 1
-
-    if process.exitcode and process.exitcode != 0:
-        shutil.rmtree(isolated_tmp_dir, ignore_errors=True)
-        err = f"Worker finalizou com código {process.exitcode}"
-        record = ExtractionRecord(config.schema_version, str(pdf_path), None, 0, None, "", None, None, None, None, 0, 0, "error", err, f"{config.engine}:isolated", 0, "none")
-        return [record], 1
-
     try:
-        records, errors = queue.get_nowait()
-    except Exception:
+        started = time.perf_counter()
+        process.start()
+        process.join(timeout=config.pdf_timeout_seconds)
+
+        if process.is_alive():
+            process.terminate()
+            process.join()
+            shutil.rmtree(isolated_tmp_dir, ignore_errors=True)
+            timeout_ms = int((time.perf_counter() - started) * 1000)
+            timeout_error = f"Timeout ao processar PDF (> {config.pdf_timeout_seconds}s)"
+            record = ExtractionRecord(config.schema_version, str(pdf_path), None, 0, None, "", None, None, None, None, 0, 0, "timeout", timeout_error, f"{config.engine}:isolated", timeout_ms, "none")
+            return [record], 1
+
+        if process.exitcode and process.exitcode != 0:
+            shutil.rmtree(isolated_tmp_dir, ignore_errors=True)
+            err = f"Worker finalizou com código {process.exitcode}"
+            record = ExtractionRecord(config.schema_version, str(pdf_path), None, 0, None, "", None, None, None, None, 0, 0, "error", err, f"{config.engine}:isolated", 0, "none")
+            return [record], 1
+
+        try:
+            records, errors = queue.get_nowait()
+        except Exception:
+            shutil.rmtree(isolated_tmp_dir, ignore_errors=True)
+            err = "Worker finalizou sem retornar resultado"
+            record = ExtractionRecord(config.schema_version, str(pdf_path), None, 0, None, "", None, None, None, None, 0, 0, "error", err, f"{config.engine}:isolated", 0, "none")
+            return [record], 1
+
+        moved_paths: dict[str, str] = {}
+        try:
+            config.output_dir.mkdir(parents=True, exist_ok=True)
+            for src in isolated_tmp_dir.iterdir():
+                target = config.output_dir / src.name
+                moved = Path(shutil.move(str(src), target))
+                moved_paths[str(src)] = str(moved)
+        except Exception as exc:
+            shutil.rmtree(isolated_tmp_dir, ignore_errors=True)
+            err = f"Falha ao consolidar artefatos isolados: {exc}"
+            record = ExtractionRecord(config.schema_version, str(pdf_path), None, 0, None, "", None, None, None, None, 0, 0, "error", err, f"{config.engine}:isolated", 0, "none")
+            return [record], 1
+
         shutil.rmtree(isolated_tmp_dir, ignore_errors=True)
-        err = "Worker finalizou sem retornar resultado"
-        record = ExtractionRecord(config.schema_version, str(pdf_path), None, 0, None, "", None, None, None, None, 0, 0, "error", err, f"{config.engine}:isolated", 0, "none")
-        return [record], 1
 
-    moved_paths: dict[str, str] = {}
-    try:
-        config.output_dir.mkdir(parents=True, exist_ok=True)
-        for src in isolated_tmp_dir.iterdir():
-            target = config.output_dir / src.name
-            moved = Path(shutil.move(str(src), target))
-            moved_paths[str(src)] = str(moved)
-    except Exception as exc:
-        shutil.rmtree(isolated_tmp_dir, ignore_errors=True)
-        err = f"Falha ao consolidar artefatos isolados: {exc}"
-        record = ExtractionRecord(config.schema_version, str(pdf_path), None, 0, None, "", None, None, None, None, 0, 0, "error", err, f"{config.engine}:isolated", 0, "none")
-        return [record], 1
-
-    shutil.rmtree(isolated_tmp_dir, ignore_errors=True)
-
-    normalized_records: list[ExtractionRecord] = []
-    for r in records:
-        normalized_records.append(
-            ExtractionRecord(
-                r.schema_version,
-                r.input_file,
-                r.page,
-                r.image_index,
-                moved_paths.get(r.output_file, r.output_file) if r.output_file else None,
-                r.filters,
-                r.width,
-                r.height,
-                r.bits_per_component,
-                r.color_space,
-                r.source_bytes,
-                r.output_bytes,
-                r.status,
-                r.error,
-                r.engine_used,
-                r.duration_ms,
-                r.correction_status,
+        normalized_records: list[ExtractionRecord] = []
+        for r in records:
+            normalized_records.append(
+                ExtractionRecord(
+                    r.schema_version,
+                    r.input_file,
+                    r.page,
+                    r.image_index,
+                    moved_paths.get(r.output_file, r.output_file) if r.output_file else None,
+                    r.filters,
+                    r.width,
+                    r.height,
+                    r.bits_per_component,
+                    r.color_space,
+                    r.source_bytes,
+                    r.output_bytes,
+                    r.status,
+                    r.error,
+                    r.engine_used,
+                    r.duration_ms,
+                    r.correction_status,
+                )
             )
-        )
-    return normalized_records, errors
+        return normalized_records, errors
+    finally:
+        try:
+            # Fecha o lado produtor da fila para sinalizar que não haverá novos itens.
+            # Isso evita descritores pendurados em retornos antecipados/erros.
+            queue.close()
+        except Exception:
+            pass
+        try:
+            # Aguarda a thread interna de feeder encerrar após o close.
+            # Sem join_thread(), a thread pode sobreviver ao escopo da função e
+            # causar vazamento de recursos/intermitência em testes concorrentes.
+            queue.join_thread()
+        except Exception:
+            pass
 
 
 def extract_from_pdf(pdf_path: Path, config: ExtractionConfig, engine: ExtractorEngine | None = None) -> tuple[list[ExtractionRecord], int]:

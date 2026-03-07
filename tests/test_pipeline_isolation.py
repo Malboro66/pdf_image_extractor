@@ -4,7 +4,7 @@ from pathlib import Path
 from unittest import mock
 
 from pdf_image_extractor.core.models import ExtractionConfig, ExtractionRecord
-from pdf_image_extractor.core.pipeline import _extract_in_subprocess
+from pdf_image_extractor.core import pipeline
 
 
 class _FakeQueue:
@@ -61,11 +61,17 @@ class PipelineIsolationTests(unittest.TestCase):
                 def is_alive(self):
                     return False
 
+            fake_ctx = mock.Mock()
+            fake_ctx.Queue.return_value = _FakeQueue(([record], 0))
+            fake_ctx.Process.side_effect = FakeProcess
+
             cfg = ExtractionConfig(input_paths=[pdf], output_dir=out_dir, isolate_pdf_processing=True)
             with mock.patch("pdf_image_extractor.core.pipeline.tempfile.mkdtemp", return_value=str(isolated_dir)), \
-                 mock.patch("pdf_image_extractor.core.pipeline.multiprocessing.Process", side_effect=FakeProcess), \
-                 mock.patch("pdf_image_extractor.core.pipeline.multiprocessing.Queue", return_value=_FakeQueue(([record], 0))):
-                records, errors = _extract_in_subprocess(pdf, cfg)
+                 mock.patch("pdf_image_extractor.core.pipeline._get_multiprocessing_context", return_value=fake_ctx):
+                records, errors = pipeline._extract_in_subprocess(pdf, cfg)
+
+            fake_ctx.Queue.assert_called_once_with(maxsize=1)
+            fake_ctx.Process.assert_called_once()
 
             self.assertEqual(errors, 0)
             self.assertTrue((out_dir / tmp_output.name).exists())
@@ -99,6 +105,10 @@ class PipelineIsolationTests(unittest.TestCase):
                 def terminate(self):
                     return
 
+            fake_ctx = mock.Mock()
+            fake_ctx.Queue.return_value = _FakeQueue(([], 0))
+            fake_ctx.Process.side_effect = FakeProcess
+
             cfg = ExtractionConfig(
                 input_paths=[pdf],
                 output_dir=out_dir,
@@ -106,9 +116,11 @@ class PipelineIsolationTests(unittest.TestCase):
                 pdf_timeout_seconds=1,
             )
             with mock.patch("pdf_image_extractor.core.pipeline.tempfile.mkdtemp", return_value=str(isolated_dir)), \
-                 mock.patch("pdf_image_extractor.core.pipeline.multiprocessing.Process", side_effect=FakeProcess), \
-                 mock.patch("pdf_image_extractor.core.pipeline.multiprocessing.Queue", return_value=_FakeQueue(([], 0))):
-                records, errors = _extract_in_subprocess(pdf, cfg)
+                 mock.patch("pdf_image_extractor.core.pipeline._get_multiprocessing_context", return_value=fake_ctx):
+                records, errors = pipeline._extract_in_subprocess(pdf, cfg)
+
+            fake_ctx.Queue.assert_called_once_with(maxsize=1)
+            fake_ctx.Process.assert_called_once()
 
             self.assertEqual(errors, 1)
             self.assertEqual(records[0].status, "timeout")
