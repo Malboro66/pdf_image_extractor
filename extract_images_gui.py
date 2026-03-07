@@ -65,6 +65,13 @@ class SettingsModel:
     max_workers: int = 4
     report_base: str = "relatorio_extracao"
 
+    @staticmethod
+    def _coerce_max_workers(value: object, default: int = 4) -> int:
+        try:
+            return max(1, int(value))
+        except (TypeError, ValueError):
+            return default
+
     def save(self, path: Path = SETTINGS_PATH) -> None:
         path.write_text(
             json.dumps(asdict(self), ensure_ascii=False, indent=2),
@@ -77,7 +84,10 @@ class SettingsModel:
             return cls()
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+            filtered = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
+            if "max_workers" in filtered:
+                filtered["max_workers"] = cls._coerce_max_workers(filtered["max_workers"])
+            return cls(**filtered)
         except Exception:
             return cls()
 
@@ -563,10 +573,10 @@ class ConfigPanel(ttk.Frame):
         settings.engine = self._engine_var.get()
         settings.recursive = self._recursive_var.get()
         settings.continue_on_error = self._continue_var.get()
-        try:
-            settings.max_workers = max(1, int(self._workers_var.get()))
-        except ValueError:
-            pass
+        settings.max_workers = settings._coerce_max_workers(
+            self._workers_var.get(),
+            default=settings.max_workers,
+        )
 
     def _set_state(self, state: str) -> None:
         for widget in self._widgets:

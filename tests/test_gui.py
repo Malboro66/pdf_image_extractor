@@ -97,6 +97,16 @@ class TestSettingsModel(unittest.TestCase):
             self.assertEqual(loaded.prefix, "test_prefix")
             self.assertEqual(loaded.max_workers, 8)
 
+    def test_load_coerces_max_workers_string_to_int(self) -> None:
+        with mock.patch("pathlib.Path.exists", return_value=True), mock.patch(
+            "pathlib.Path.read_text",
+            return_value=json.dumps({"max_workers": "8", "engine": "auto"}),
+        ):
+            settings = SettingsModel.load(Path("/settings.json"))
+
+        self.assertEqual(settings.max_workers, 8)
+        self.assertIsInstance(settings.max_workers, int)
+
     def test_load_returns_defaults_when_file_missing(self) -> None:
         with mock.patch("pathlib.Path.exists", return_value=False):
             settings = SettingsModel.load(Path("/nonexistent.json"))

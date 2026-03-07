@@ -1,3 +1,11 @@
+import importlib.util
+from unittest.mock import Mock
+
+import pytest
+
+if importlib.util.find_spec("requests") is None:  # pragma: no cover - depende do ambiente
+    pytest.skip("requests não instalado no ambiente", allow_module_level=True)
+
 import requests
 
 from pdf_image_extractor.adapters.transport import HttpClient, HttpClientConfig
@@ -13,13 +21,17 @@ class _Response:
             raise requests.HTTPError(f"status={self.status_code}")
 
 
-def test_fetch_bytes_retries_exception_then_succeeds(mocker) -> None:
-    session = mocker.Mock()
+def test_fetch_bytes_retries_exception_then_succeeds(monkeypatch) -> None:
+    session = Mock()
     session.request.side_effect = [
         requests.Timeout("timeout"),
         _Response(status_code=200, content=b"payload"),
     ]
-    sleep_spy = mocker.patch("pdf_image_extractor.adapters.transport.http_client.time.sleep")
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(
+        "pdf_image_extractor.adapters.transport.http_client.time.sleep",
+        lambda seconds: sleep_calls.append(seconds),
+    )
 
     client = HttpClient(HttpClientConfig(max_retries=2, backoff_base_seconds=0.1), session=session)
 
@@ -27,17 +39,21 @@ def test_fetch_bytes_retries_exception_then_succeeds(mocker) -> None:
 
     assert result == b"payload"
     assert session.request.call_count == 2
-    sleep_spy.assert_called_once_with(0.1)
+    assert sleep_calls == [0.1]
 
 
-def test_fetch_bytes_retries_status_and_returns_none_when_exhausted(mocker) -> None:
-    session = mocker.Mock()
+def test_fetch_bytes_retries_status_and_returns_none_when_exhausted(monkeypatch) -> None:
+    session = Mock()
     session.request.side_effect = [
         _Response(status_code=503),
         _Response(status_code=503),
         _Response(status_code=503),
     ]
-    sleep_spy = mocker.patch("pdf_image_extractor.adapters.transport.http_client.time.sleep")
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(
+        "pdf_image_extractor.adapters.transport.http_client.time.sleep",
+        lambda seconds: sleep_calls.append(seconds),
+    )
 
     client = HttpClient(HttpClientConfig(max_retries=2, backoff_base_seconds=0.25), session=session)
 
@@ -45,11 +61,11 @@ def test_fetch_bytes_retries_status_and_returns_none_when_exhausted(mocker) -> N
 
     assert result is None
     assert session.request.call_count == 3
-    assert [call.args[0] for call in sleep_spy.call_args_list] == [0.25, 0.5]
+    assert sleep_calls == [0.25, 0.5]
 
 
-def test_fetch_bytes_rotates_user_agent(mocker) -> None:
-    session = mocker.Mock()
+def test_fetch_bytes_rotates_user_agent() -> None:
+    session = Mock()
     session.request.side_effect = [
         _Response(status_code=200, content=b"a"),
         _Response(status_code=200, content=b"b"),
