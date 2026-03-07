@@ -6,3 +6,5 @@ pip-audit
 pypdf
 pillow
 mutmut
+requests
+pytest-mock
